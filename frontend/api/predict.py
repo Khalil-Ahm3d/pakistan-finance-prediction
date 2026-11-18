@@ -1,135 +1,168 @@
 
+import base64
 import json
+
 import numpy as np
+import pandas as pd
 from http.server import BaseHTTPRequestHandler
 
 from model_loader import load_trained_model
 from preprocessing import prepare_history
+from file_validation import (
+    process_uploaded_file,
+    validate_financial_data,
+)
+
+
+MAX_REQUEST_BYTES = 15 * 1024 * 1024
+
+VALID_ASSETS = {"OGDC", "HBL", "MEBL", "ENGRO", "KSE100"}
+VALID_MODELS = {"RNN", "LSTM", "GRU"}
 
 
 class handler(BaseHTTPRequestHandler):
 
     def send_json(self, status, data):
+        response = json.dumps(data).encode("utf-8")
+
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode("utf-8"))
+        self.wfile.write(response)
 
     def do_POST(self):
         try:
-            content_length = int(
-                self.headers.get("Content-Length", 0)
-            )
+            length = int(self.headers.get("Content-Length", 0))
 
-            if content_length <= 0 or content_length > 5_000_000:
-                return self.send_json(
-                    400, {"error": "Invalid request size"}
+            if length <= 0 or length > MAX_REQUEST_BYTES:
+                raise ValueError(
+                    "Request is empty or exceeds the 15 MB limit."
                 )
 
-            data = json.loads(
-                self.rfile.read(content_length)
-            )
+            body = self.rfile.read(length)
+            payload = json.loads(body)
 
-            asset = str(data.get("asset", "")).upper()
-            model_name = str(data.get("model", "")).upper()
-            records = data.get("records")
+            asset = str(payload.get("asset", "")).upper()
+            model_name = str(payload.get("model", "")).upper()
 
-            if not isinstance(records, list):
-                return self.send_json(
-                    400, {"error": "Historical records are required"}
+            if asset not in VALID_ASSETS:
+                raise ValueError("Select a supported financial asset.")
+
+            if model_name not in VALID_MODELS:
+                raise ValueError("Select RNN, LSTM, or GRU.")
+
+            # Uploaded file: CSV, Excel, or PDF
+            if "file" in payload:
+                uploaded = payload["file"]
+
+                filename = uploaded.get("filename", "")
+                encoded = uploaded.get("content_base64", "")
+
+                if not filename or not encoded:
+                    raise ValueError("Uploaded file is incomplete.")
+
+                try:
+                    file_bytes = base64.b64decode(
+                        encoded,
+                        validate=True
+                    )
+                except Exception:
+                    raise ValueError("Uploaded file encoding is invalid.")
+
+                records = process_uploaded_file(
+                    filename,
+                    file_bytes,
+                    asset
                 )
 
-            # Calculate the exact historical feature sequence.
-            history = prepare_history(asset, records)
+            # Manual financial history
+            elif "records" in payload:
+                records = validate_financial_data(
+                    pd.DataFrame(payload["records"]),
+                    asset
+                )
 
-            # Load the actual trained model and saved scalers.
+            else:
+                raise ValueError(
+                    "Provide a financial data file or financial records."
+                )
+
+            # Recheck and prepare the financial history.
+            features, feature_columns, current_close, last_date = (
+                prepare_history(asset, records)
+            )
+
             trained = load_trained_model(asset, model_name)
-
             config = trained["config"]
-            expected_columns = config["feature_columns"]
 
-            if history["feature_columns"] != expected_columns:
-                return self.send_json(
-                    400,
-                    {"error": "Feature configuration mismatch"}
+            if feature_columns != config["feature_columns"]:
+                raise ValueError(
+                    "Financial feature definitions do not match "
+                    "the trained model."
                 )
 
-            features = np.asarray(
-                history["features"],
-                dtype=np.float64
+            lookback = int(config["lookback"])
+            expected_features = len(config["feature_columns"])
+
+            if features.shape != (lookback, expected_features):
+                raise ValueError(
+                    "Financial history has an incorrect input shape."
+                )
+
+            scaled_features = trained["feature_scaler"].transform(
+                features
             )
 
-            if features.shape != tuple(config["input_shape"]):
-                return self.send_json(
-                    400, {"error": "Incorrect model input shape"}
-                )
-
-            # Apply the original training scaler.
-            scaled = trained["feature_scaler"].transform(features)
-
-            model_input = scaled.reshape(
+            model_input = scaled_features.reshape(
                 1,
-                config["lookback"],
-                len(expected_columns)
+                lookback,
+                expected_features
             )
 
-            # Run the trained model.
-            prediction_scaled = trained["model"].predict(
+            scaled_prediction = trained["model"].predict(
                 model_input,
                 verbose=0
             )
 
-            prediction = trained["target_scaler"].inverse_transform(
-                np.asarray(prediction_scaled).reshape(-1, 1)
-            )[0, 0]
+            predicted_return = trained["target_scaler"].inverse_transform(
+                np.asarray(scaled_prediction).reshape(-1, 1)
+            )[0][0]
 
-            if not np.isfinite(prediction):
-                raise ValueError("Model returned an invalid prediction")
+            if not np.isfinite(predicted_return):
+                raise ValueError(
+                    "The model produced an invalid prediction."
+                )
 
-            current_close = history["current_close"]
+            estimated_close = current_close * (1 + predicted_return)
 
-            result = {
+            self.send_json(200, {
                 "status": "success",
                 "asset": asset,
                 "model": model_name,
-                "last_historical_date": history["last_date"],
-                "predicted_next_day_return": float(prediction),
-                "predicted_return_percent": float(prediction * 100),
-                "current_close": current_close,
-                "estimated_next_close": float(
-                    current_close * (1 + prediction)
+                "last_data_date": last_date,
+                "current_close": float(current_close),
+                "predicted_next_day_return_percent": float(
+                    predicted_return * 100
                 ),
-                "target": config["target"],
-                "disclaimer": "Experimental academic forecast, not guaranteed trading advice."
-            }
-
-            return self.send_json(200, result)
-
-        except json.JSONDecodeError:
-            return self.send_json(
-                400, {"error": "Invalid JSON request"}
-            )
+                "estimated_next_close": float(estimated_close),
+                "disclaimer": (
+                    "Experimental academic prediction, not "
+                    "investment advice."
+                )
+            })
 
         except ValueError as error:
-            return self.send_json(
-                400, {"error": str(error)}
-            )
+            self.send_json(400, {
+                "status": "error",
+                "message": str(error)
+            })
 
         except Exception:
-            return self.send_json(
-                500,
-                {
-                    "error": "Prediction failed. Check Vercel deployment logs."
-                }
-            )
-
-    def do_GET(self):
-        return self.send_json(
-            405, {"error": "Use POST to generate predictions"}
-        )
-
-    def do_GET(self):
-        return self.send_json(
-            405,
-            {"error": "Use POST to generate predictions"}
-        )
+            self.send_json(500, {
+                "status": "error",
+                "message": (
+                    "Prediction service encountered an error. "
+                    "Please check the financial data and try again."
+                )
+            })
