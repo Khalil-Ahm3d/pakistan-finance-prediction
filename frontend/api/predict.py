@@ -14,7 +14,9 @@ from file_validation import (
 )
 
 
-MAX_REQUEST_BYTES = 15 * 1024 * 1024
+# Vercel request limit is approximately 4.5 MB.
+# A 3 MB file becomes larger after Base64 encoding.
+MAX_REQUEST_BYTES = int(4.4 * 1024 * 1024)
 
 VALID_ASSETS = {"OGDC", "HBL", "MEBL", "ENGRO", "KSE100"}
 VALID_MODELS = {"RNN", "LSTM", "GRU"}
@@ -35,9 +37,13 @@ class handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
 
-            if length <= 0 or length > MAX_REQUEST_BYTES:
+            if length <= 0:
+                raise ValueError("The request is empty.")
+
+            if length > MAX_REQUEST_BYTES:
                 raise ValueError(
-                    "Request is empty or exceeds the 15 MB limit."
+                    "Request is too large. Please use a financial "
+                    "file smaller than 3 MB."
                 )
 
             body = self.rfile.read(length)
@@ -70,6 +76,11 @@ class handler(BaseHTTPRequestHandler):
                 except Exception:
                     raise ValueError("Uploaded file encoding is invalid.")
 
+                if len(file_bytes) > 3 * 1024 * 1024:
+                    raise ValueError(
+                        "The uploaded financial file exceeds the 3 MB limit."
+                    )
+
                 records = process_uploaded_file(
                     filename,
                     file_bytes,
@@ -88,7 +99,7 @@ class handler(BaseHTTPRequestHandler):
                     "Provide a financial data file or financial records."
                 )
 
-            # Recheck and prepare the financial history.
+            # Prepare the financial history.
             features, feature_columns, current_close, last_date = (
                 prepare_history(asset, records)
             )
