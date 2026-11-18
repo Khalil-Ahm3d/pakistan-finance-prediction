@@ -87,8 +87,8 @@ export default function Home() {
       return;
     }
 
-    if (file.size > 10 * 1024 * 1024) {
-      setMessage("The maximum file size is 10 MB.");
+    if (file.size > 3 * 1024 * 1024) {
+      setMessage("The maximum file size is 3 MB.");
       return;
     }
 
@@ -466,7 +466,7 @@ export default function Home() {
                       </span>
 
                       <span className="mt-1 text-xs text-slate-400">
-                        Maximum file size: 10 MB
+                        Maximum file size: 3 MB
                       </span>
 
                       <input
